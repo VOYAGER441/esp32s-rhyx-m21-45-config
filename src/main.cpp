@@ -1,5 +1,6 @@
-// ESP32-CAM (GC2145) -> UDP JPEG streamer, pipelined (encode on core 1, send on core 0)
-// Packet: [camID 1B][frameID 2B][chunkIdx 2B][chunkCount 2B][payload]
+// ESP32-CAM (GC2145) -> UDP JPEG streamer
+// Each frame is split into STRIPS horizontal strips, JPEG-encoded in parallel on both cores.
+// Packet: [camID 1B][frameID 2B][stripIdx 1B][stripCount 1B][chunkIdx 2B][chunkCount 2B][payload]
 
 #include <Arduino.h>
 #include "esp_camera.h"
@@ -21,19 +22,13 @@ IPAddress dns1(8, 8, 8, 8);
 IPAddress dest_ip(192, 168, 0, 112);     // your PC
 const uint16_t dest_port = 2222;
 
-// Resolution: FRAMESIZE_QQVGA (160x120) / FRAMESIZE_QVGA (320x240) / FRAMESIZE_VGA (640x480)
-#define FRAME_SIZE    FRAMESIZE_VGA
-
-// Test switch: 0 = grayscale + software JPEG (works), 1 = ask sensor for hardware JPEG.
-// If the sensor doesn't support it, camera init fails and prints an error.
-#define USE_HW_JPEG   0
-
-#define JPEG_QUALITY  50      // software mode: 1-100, higher = better/bigger
-#define HW_JPEG_QUAL  12      // hardware mode: 0-63, LOWER = better
-#define TARGET_FPS    60      // upper limit; real FPS is whatever the board can do
+#define FRAME_SIZE    FRAMESIZE_HVGA      // or FRAMESIZE_SVGA
+#define STRIPS        1                  // 2 = parallel encode on both cores, 1 = single encoder
+#define JPEG_QUALITY  20                 // 1-100; lower = faster encode + smaller packets
+#define TARGET_FPS    60                 // upper limit only
 
 #define CHUNK_SIZE    1400
-#define HDR_SIZE      7
+#define HDR_SIZE      9
 // ------------------------------------------------
 
 #define PWDN_GPIO_NUM  32
@@ -54,9 +49,14 @@ const uint16_t dest_port = 2222;
 #define PCLK_GPIO_NUM  22
 
 struct Jpg { uint8_t *buf; size_t len; };
+struct FrameOut { Jpg strip[2]; };
 
 WiFiUDP udp;
-QueueHandle_t jpgQueue;
+QueueHandle_t outQueue;
+SemaphoreHandle_t helperStart, helperDone;
+static camera_fb_t *sharedFb = nullptr;
+static Jpg helperOut = { nullptr, 0 };
+
 static uint8_t pkt[HDR_SIZE + CHUNK_SIZE];
 static uint16_t frameId = 0;
 
@@ -80,15 +80,8 @@ void setupCamera() {
   c.pin_pwdn = PWDN_GPIO_NUM;
   c.pin_reset = RESET_GPIO_NUM;
   c.xclk_freq_hz = 20000000;
-  c.sccb_i2c_port = 0;
-
-#if USE_HW_JPEG
-  c.pixel_format = PIXFORMAT_JPEG;
-  c.jpeg_quality = HW_JPEG_QUAL;
-#else
-  c.pixel_format = PIXFORMAT_GRAYSCALE;
+  c.pixel_format = PIXFORMAT_GRAYSCALE;   // 1 byte/pixel = cheapest to encode
   c.jpeg_quality = 12;
-#endif
 
   if (psramFound()) {
     c.frame_size  = FRAME_SIZE;
@@ -96,6 +89,7 @@ void setupCamera() {
     c.fb_location = CAMERA_FB_IN_PSRAM;
     c.grab_mode   = CAMERA_GRAB_LATEST;
   } else {
+    Serial.println("No PSRAM found - VGA/SVGA need PSRAM, falling back to QQVGA");
     c.frame_size  = FRAMESIZE_QQVGA;
     c.fb_count    = 1;
     c.fb_location = CAMERA_FB_IN_DRAM;
@@ -104,8 +98,7 @@ void setupCamera() {
 
   esp_err_t err = esp_camera_init(&c);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed: 0x%x %s\n", err,
-                  USE_HW_JPEG ? "(sensor probably has no hardware JPEG - set USE_HW_JPEG 0)" : "");
+    Serial.printf("Camera init failed: 0x%x\n", err);
     while (true) delay(1000);
   }
 
@@ -132,17 +125,31 @@ void connectWiFi() {
   Serial.println(WiFi.localIP());
 }
 
-void sendJpeg(const uint8_t *jpg, size_t len) {
-  uint16_t chunkCount = (len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+// Encode one horizontal strip of the grayscale frame
+static bool encodeStrip(camera_fb_t *fb, int idx, Jpg &out) {
+  int h = fb->height / STRIPS;
+  camera_fb_t t = *fb;
+  t.buf    = fb->buf + (size_t)idx * h * fb->width;
+  t.height = h;
+  t.len    = (size_t)h * fb->width;
+  out.buf = nullptr;
+  out.len = 0;
+  return frame2jpg(&t, JPEG_QUALITY, &out.buf, &out.len) && out.buf;
+}
+
+static void sendStrip(const Jpg &j, uint8_t stripIdx) {
+  uint16_t chunkCount = (j.len + CHUNK_SIZE - 1) / CHUNK_SIZE;
   pkt[0] = CAMERA_ID;
   memcpy(&pkt[1], &frameId, 2);
-  memcpy(&pkt[5], &chunkCount, 2);
+  pkt[3] = stripIdx;
+  pkt[4] = STRIPS;
+  memcpy(&pkt[7], &chunkCount, 2);
 
   for (uint16_t i = 0; i < chunkCount; i++) {
     size_t off = (size_t)i * CHUNK_SIZE;
-    size_t n = (len - off < (size_t)CHUNK_SIZE) ? (len - off) : (size_t)CHUNK_SIZE;
-    memcpy(&pkt[3], &i, 2);
-    memcpy(&pkt[HDR_SIZE], jpg + off, n);
+    size_t n = (j.len - off < (size_t)CHUNK_SIZE) ? (j.len - off) : (size_t)CHUNK_SIZE;
+    memcpy(&pkt[5], &i, 2);
+    memcpy(&pkt[HDR_SIZE], j.buf + off, n);
 
     udp.beginPacket(dest_ip, dest_port);
     udp.write(pkt, HDR_SIZE + n);
@@ -150,10 +157,18 @@ void sendJpeg(const uint8_t *jpg, size_t len) {
 
     if ((i & 7) == 7) delay(1);
   }
-  frameId++;
 }
 
-// Core 1: grab frame + compress to JPEG
+// Core 0: encodes the bottom strip while core 1 encodes the top strip
+void helperTask(void *) {
+  for (;;) {
+    xSemaphoreTake(helperStart, portMAX_DELAY);
+    encodeStrip(sharedFb, 1, helperOut);
+    xSemaphoreGive(helperDone);
+  }
+}
+
+// Core 1: grab frame, encode top strip (+ trigger helper), queue result
 void captureTask(void *) {
   const uint32_t interval = 1000 / TARGET_FPS;
   for (;;) {
@@ -162,41 +177,52 @@ void captureTask(void *) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
 
-    Jpg j = { nullptr, 0 };
-#if USE_HW_JPEG
-    j.buf = (uint8_t *)malloc(fb->len);
-    if (j.buf) { memcpy(j.buf, fb->buf, fb->len); j.len = fb->len; }
-    esp_camera_fb_return(fb);
-#else
-    bool ok = frame2jpg(fb, JPEG_QUALITY, &j.buf, &j.len);
-    esp_camera_fb_return(fb);
-    if (!ok) j.buf = nullptr;
+    FrameOut o = {};
+#if STRIPS == 2
+    sharedFb = fb;
+    xSemaphoreGive(helperStart);
 #endif
-    if (!j.buf) continue;
+    bool ok = encodeStrip(fb, 0, o.strip[0]);
+#if STRIPS == 2
+    xSemaphoreTake(helperDone, portMAX_DELAY);
+    o.strip[1] = helperOut;
+    ok = ok && o.strip[1].buf;
+#endif
+    esp_camera_fb_return(fb);
+
+    if (!ok) {
+      for (int i = 0; i < STRIPS; i++) if (o.strip[i].buf) free(o.strip[i].buf);
+      vTaskDelay(1);
+      continue;
+    }
 
     encMsAcc += millis() - t0;
     encodedFrames++;
 
-    // If the sender is still busy, drop this frame instead of building latency
-    if (xQueueSend(jpgQueue, &j, 0) != pdTRUE) {
-      free(j.buf);
+    if (xQueueSend(outQueue, &o, 0) != pdTRUE) {   // sender busy -> drop, don't add latency
+      for (int i = 0; i < STRIPS; i++) free(o.strip[i].buf);
       droppedFrames++;
     }
 
     uint32_t el = millis() - t0;
     if (el < interval) vTaskDelay(pdMS_TO_TICKS(interval - el));
-    else vTaskDelay(1);   // always yield so the watchdog stays happy
+    else vTaskDelay(1);
   }
 }
 
-// Core 0: send over UDP
+// Core 0: send all strips of a frame over UDP
 void sendTask(void *) {
-  Jpg j;
+  FrameOut o;
   for (;;) {
-    if (xQueueReceive(jpgQueue, &j, portMAX_DELAY) == pdTRUE) {
-      sendJpeg(j.buf, j.len);
-      lastSize = j.len;
-      free(j.buf);
+    if (xQueueReceive(outQueue, &o, portMAX_DELAY) == pdTRUE) {
+      size_t total = 0;
+      for (int i = 0; i < STRIPS; i++) {
+        sendStrip(o.strip[i], i);
+        total += o.strip[i].len;
+        free(o.strip[i].buf);
+      }
+      frameId++;
+      lastSize = total;
       sentFrames++;
     }
   }
@@ -209,13 +235,18 @@ void setup() {
   connectWiFi();
   udp.begin(12345);
 
-  jpgQueue = xQueueCreate(2, sizeof(Jpg));
-  xTaskCreatePinnedToCore(captureTask, "capture", 8192, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(sendTask,    "send",    4096, NULL, 2, NULL, 0);
+  outQueue    = xQueueCreate(2, sizeof(FrameOut));
+  helperStart = xSemaphoreCreateBinary();
+  helperDone  = xSemaphoreCreateBinary();
 
-  Serial.printf("Streaming cam %d to %s:%u (%s)\n", CAMERA_ID,
-                dest_ip.toString().c_str(), dest_port,
-                USE_HW_JPEG ? "hardware JPEG" : "software JPEG");
+  xTaskCreatePinnedToCore(captureTask, "capture", 10240, NULL, 2, NULL, 1);
+#if STRIPS == 2
+  xTaskCreatePinnedToCore(helperTask,  "helper",  10240, NULL, 2, NULL, 0);
+#endif
+  xTaskCreatePinnedToCore(sendTask,    "send",     4096, NULL, 2, NULL, 0);
+
+  Serial.printf("Streaming cam %d to %s:%u  strips=%d\n", CAMERA_ID,
+                dest_ip.toString().c_str(), dest_port, STRIPS);
 }
 
 void loop() {
